@@ -14,7 +14,7 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import conv_fuse_enabled, fused_conv1d_silu, gated_delta_update
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
@@ -156,16 +156,29 @@ class GatedDeltaNet(nn.Module):
 
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        n_keep = self.conv_kernel_size - 1
+        if (
+            mask is None
+            and B == 1
+            and S >= 64
+            and (cache is None or cache.lengths is None)
+            and conv_fuse_enabled()
+        ):
+            # Fused prefill conv branch: no concatenated input materialized
+            # (the kernel indexes the state rows), silu folded in.
+            if cache is not None:
+                cache[0] = mx.contiguous(qkv[:, -n_keep:, :])
+            conv_out = fused_conv1d_silu(qkv, conv_state, self.conv1d.weight)
+        else:
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            if cache is not None:
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -346,11 +359,13 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+        # Raw HF checkpoints are detected by the unconverted conv1d layout.
+        # MTP weights alone are not a reliable signal: converted checkpoints
+        # may retain them, and their norms are already shifted.
+        should_shift_norm_weights = has_unsanitized_conv1d
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:

@@ -13,6 +13,108 @@ import mlx.nn as nn
 _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
 
 
+def conv_fuse_enabled():
+    return os.environ.get("MLX_GDN_CONVFUSE", "1") != "0"
+
+
+# Fused prefill conv branch: silu(depthwise_conv1d_k4(state ++ x)) computed
+# in one pass, indexing the (K-1) initial-state rows in-kernel instead of
+# materializing the concatenated input, and folding the silu instead of two
+# more elementwise round-trips. Roundings are explicit (RNE via integer bit
+# ops for bfloat) so fast-math cannot contract them; the conv accumulates
+# in float in ascending tap order like the conv kernel it replaces.
+_conv_silu_header = """
+template <typename U>
+inline float round_U(float x);
+
+template <>
+inline float round_U<bfloat16_t>(float x) {
+  uint u = as_type<uint>(x);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  u &= 0xffff0000u;
+  return as_type<float>(u);
+}
+
+template <>
+inline float round_U<half>(float x) {
+  return float(half(x));
+}
+
+template <>
+inline float round_U<float>(float x) {
+  return x;
+}
+"""
+
+_conv_silu_source = """
+    // one thread per (t, 8 channels)
+    uint gid = thread_position_in_grid.x;
+    const uint c8 = C / 8;
+    const uint t = gid / c8;
+    const uint c0 = (gid % c8) * 8;
+
+    float w_[KS][8];
+    for (uint j = 0; j < KS; j++) {
+      for (uint e = 0; e < 8; e++) {
+        w_[j][e] = float(w[(c0 + e) * KS + j]);
+      }
+    }
+
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (uint j = 0; j < KS; j++) {
+      const int src = int(t) + int(j) - int(KS - 1);
+      const device T* row =
+          (src < 0) ? (state + (src + int(KS - 1)) * C + c0)
+                    : (x + src * C + c0);
+      for (uint e = 0; e < 8; e++) {
+        acc[e] += w_[j][e] * float(row[e]);
+      }
+    }
+    device T* orow = out + t * C + c0;
+    for (uint e = 0; e < 8; e++) {
+      // Replicate mx.sigmoid's stable form with per-op rounding in T:
+      // y = 1/(1+exp(|x|)); sigmoid = x < 0 ? y : 1 - y.
+      const float c = round_U<T>(acc[e]);
+      const float ex = round_U<T>(metal::exp(metal::abs(c)));
+      const float den = round_U<T>(1.0f + ex);
+      const float y_ = round_U<T>(1.0f / den);
+      const float s = (c < 0.0f) ? y_ : round_U<T>(1.0f - y_);
+      orow[e] = static_cast<T>(round_U<T>(c * s));
+    }
+"""
+
+_conv_silu_kernel = (
+    mx.fast.metal_kernel(
+        name="gdn_conv_silu",
+        input_names=["x", "state", "w"],
+        output_names=["out"],
+        header=_conv_silu_header,
+        source=_conv_silu_source,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
+
+def fused_conv1d_silu(x, state, weight):
+    """x: [1, T, C]; state: [1, KS-1, C]; weight: conv1d weight [C, KS, 1]."""
+    _, T, C = x.shape
+    KS = weight.shape[1]
+    (out,) = _conv_silu_kernel(
+        inputs=[
+            x.reshape(T, C),
+            state.reshape(KS - 1, C),
+            weight.reshape(C, KS),
+        ],
+        template=[("T", x.dtype), ("C", C), ("KS", KS)],
+        grid=(T * (C // 8), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(T * C,)],
+        output_dtypes=[x.dtype],
+    )
+    return out.reshape(1, T, C)
+
+
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
