@@ -8,13 +8,17 @@ import mlx.nn as nn
 
 # Merge decode-side projection launches (q/k/v -> qkv, w1/w3 -> w13).
 # MLX_LFM2_FUSED_PROJ=0 restores the upstream per-projection layout exactly.
-_FUSED_PROJ = os.environ.get("MLX_LFM2_FUSED_PROJ", "1") != "0"
+# Read at module construction; __call__ branches on the instance's layout so
+# differently-configured instances coexist in one process (in-process A/B).
+def _fused_proj():
+    return os.environ.get("MLX_LFM2_FUSED_PROJ", "1") != "0"
 
 
 # Fuse the decode-step ShortConv glue (split, B*x gate, state shift, 3-tap
 # depthwise conv, C*y gate) into one kernel. MLX_LFM2_CONVFUSE=0 restores the
 # upstream op-by-op path exactly.
-_CONV_FUSE = os.environ.get("MLX_LFM2_CONVFUSE", "1") != "0"
+def _conv_fuse():
+    return os.environ.get("MLX_LFM2_CONVFUSE", "1") != "0"
 
 # Roundings between the replaced kernels are explicit (RNE via integer bit ops
 # for bfloat) so fast-math cannot contract them; the conv accumulates in float
@@ -186,7 +190,7 @@ class Attention(nn.Module):
         self.q_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
         self.k_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
 
-        if _FUSED_PROJ:
+        if _fused_proj():
             self.qkv_proj = nn.Linear(
                 dim, (n_heads + 2 * n_kv_heads) * head_dim, bias=False
             )
@@ -210,7 +214,7 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        if _FUSED_PROJ:
+        if hasattr(self, "qkv_proj"):
             if B * L == 1:
                 qkv = self.qkv_proj(x).reshape(
                     B, L, self.n_heads + 2 * self.n_kv_heads, self.head_dim
@@ -283,7 +287,7 @@ class ShortConv(nn.Module):
         cache: Optional[Any] = None,
     ):
         if (
-            _CONV_FUSE
+            _conv_fuse()
             and _conv_step_kernel is not None
             and not self.bias
             and cache is not None
@@ -352,7 +356,7 @@ class MLP(nn.Module):
             ff_dim = multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
 
         self.ff_dim = ff_dim
-        if _FUSED_PROJ:
+        if _fused_proj():
             self.w13 = nn.Linear(dim, 2 * ff_dim, bias=False)
         else:
             self.w1 = nn.Linear(dim, ff_dim, bias=False)
@@ -360,7 +364,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(ff_dim, dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        if _FUSED_PROJ:
+        if hasattr(self, "w13"):
             if x.size == x.shape[-1]:
                 w1x, w3x = mx.split(self.w13(x), 2, axis=-1)
             else:
@@ -480,7 +484,9 @@ class Model(nn.Module):
 
             sanitized_weights[name] = param
 
-        if _FUSED_PROJ:
+        if any("qkv_proj" in k for k, _ in self.parameters().items()) or hasattr(
+            self.model.layers[self.model.fa_idx].self_attn, "qkv_proj"
+        ):
             sanitized_weights = self._merge_projections(sanitized_weights)
         return sanitized_weights
 
