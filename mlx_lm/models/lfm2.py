@@ -237,6 +237,33 @@ from .base import (
 from .cache import ArraysCache, KVCache
 
 
+class TrimmableConvCache(ArraysCache):
+    """ArraysCache for the ShortConv state that keeps the last `hist` rows of
+    the conv input stream (instead of only kernel_size-1), which makes
+    trimming n <= hist - min_rows tokens a row slice. Enables speculative
+    decoding (mlx-lm requires every cache to be trimmable to rewind rejected
+    draft tokens); the sliding-window state alone cannot rewind.
+    Enabled via MLX_LFM2_SPEC_CACHE=1 (costs one extra concat per conv layer
+    per decode step, so it is off for normal decoding)."""
+
+    def __init__(self, size=1, hist=16, min_rows=2):
+        super().__init__(size)
+        self.hist = max(hist, min_rows)
+        self.min_rows = min_rows
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        c = self.cache[0]
+        if c is None or n <= 0:
+            return 0
+        n = min(n, c.shape[1] - self.min_rows)
+        if n > 0:
+            self.cache[0] = c[:, : c.shape[1] - n, :]
+        return max(n, 0)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -420,13 +447,20 @@ class ShortConv(nn.Module):
             and x.shape[1] == 1
         ):
             BCx = self.in_proj(x)
-            state = cache[0]
-            if state is None:
-                state = mx.zeros(
+            full = cache[0]
+            if full is None:
+                full = mx.zeros(
                     (BCx.shape[0], self.L_cache - 1, self.args.hidden_size),
                     dtype=BCx.dtype,
                 )
-            y, cache[0] = _fused_conv_step(BCx, state, self.conv.weight)
+            state = full[:, -(self.L_cache - 1) :, :]
+            y, new_state = _fused_conv_step(BCx, state, self.conv.weight)
+            if isinstance(cache, TrimmableConvCache):
+                cache[0] = mx.concatenate([full, new_state[:, -1:, :]], axis=1)[
+                    :, -cache.hist :, :
+                ]
+            else:
+                cache[0] = new_state
             cache.advance(1)
             return self.out_proj(y)
 
@@ -437,20 +471,25 @@ class ShortConv(nn.Module):
             Bx = mx.where(mask[..., None], Bx, 0)
 
         if cache is not None:
+            n_keep = self.L_cache - 1
             if cache[0] is None:
-                state = mx.zeros(
-                    (Bx.shape[0], self.L_cache - 1, self.args.hidden_size),
+                full = mx.zeros(
+                    (Bx.shape[0], n_keep, self.args.hidden_size),
                     dtype=Bx.dtype,
                 )
             else:
-                state = cache[0]
-            Bx = mx.concatenate([state, Bx], axis=1)
-            n_keep = self.L_cache - 1
+                full = cache[0]
             t = x.shape[1]
+            Bx_cat = mx.concatenate([full, Bx], axis=1)
+            # conv consumes exactly the minimal window; extra history rows
+            # (TrimmableConvCache) stay behind it
+            Bx = Bx_cat[:, -(t + n_keep) :, :]
             if cache.lengths is not None:
                 ends = mx.clip(cache.lengths, 0, t)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(Bx, positions, axis=1)
+            elif isinstance(cache, TrimmableConvCache):
+                cache[0] = Bx_cat[:, -cache.hist :, :]
             else:
                 cache[0] = Bx[:, -n_keep:, :]
             cache.advance(t)
@@ -640,7 +679,16 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
+        # MLX_LFM2_SPEC_CACHE=1 makes the conv caches trimmable (required for
+        # speculative decoding); costs one extra concat per conv layer per
+        # decode step, so plain decoding keeps the sliding-window cache.
+        if os.environ.get("MLX_LFM2_SPEC_CACHE", "0") != "0":
+            conv_cache = lambda: TrimmableConvCache(
+                size=1, hist=16, min_rows=self.args.conv_L_cache - 1
+            )
+        else:
+            conv_cache = lambda: ArraysCache(size=1)
         return [
-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
+            KVCache() if l.is_attention_layer else conv_cache()
             for l in self.layers
         ]
