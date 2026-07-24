@@ -107,6 +107,103 @@ def _fused_conv_step(BCx, state, weight):
     return y.reshape(B, 1, C), state_out
 
 
+# Fuse the attn decode-step pre-processing (per-head q/k RMSNorm + RoPE, 4
+# kernels/layer) into one. MLX_LFM2_QKROPE_FUSE=0 restores the op-by-op path.
+def _qkrope_fuse():
+    return os.environ.get("MLX_LFM2_QKROPE_FUSE", "1") != "0"
+
+
+# Numerics replicate the upstream kernels exactly: rms_norm's axis-64 path
+# (16 active lanes x 4 sequential squares, 32-wide simd_sum,
+# precise::rsqrt(acc/64+eps), w * T(x*inv) multiplied in T) and
+# rope_single's non-traditional forward (exp2(-d*log2 base), fast::cos/sin,
+# float rotate, cast T on store); normed values cross to the rope phase
+# through T-typed threadgroup memory as they would through DRAM.
+_qkrope_source = """
+    // one simdgroup per head; heads [0,NQ) = q, [NQ, NQ+NKV) = k
+    // consts: [0]=log2_base, [1]=eps, [2]=offset (exact float below 2^24)
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint head = threadgroup_position_in_grid.x * SG_PER_TG + sg;
+    if (head >= NQ + NKV) return;
+
+    const bool is_q = head < NQ;
+    const device T* x = qkv + (is_q ? head * HD : NQ * HD + (head - NQ) * HD);
+    const device T* w = is_q ? qw : kw;
+
+    threadgroup T buf[SG_PER_TG][HD];
+
+    float acc = 0.0f;
+    float tx[4];
+    if (lane < HD / 4) {
+      for (int i = 0; i < 4; i++) {
+        tx[i] = (float)x[lane * 4 + i];
+        acc += tx[i] * tx[i];
+      }
+    }
+    acc = simd_sum(acc);
+    float inv = metal::precise::rsqrt(acc / (float)HD + consts[1]);
+    if (lane < HD / 4) {
+      for (int i = 0; i < 4; i++) {
+        buf[sg][lane * 4 + i] = w[lane * 4 + i] * static_cast<T>(tx[i] * inv);
+      }
+    }
+    simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    float x1 = (float)buf[sg][lane];
+    float x2 = (float)buf[sg][lane + HD / 2];
+    float d = static_cast<float>(lane) / static_cast<float>(HD / 2);
+    float inv_freq = metal::exp2(-d * consts[0]);
+    float theta = consts[2] * inv_freq;
+    float costheta = metal::fast::cos(theta);
+    float sintheta = metal::fast::sin(theta);
+    float rx1 = x1 * costheta - x2 * sintheta;
+    float rx2 = x1 * sintheta + x2 * costheta;
+
+    device T* o = is_q ? (q_out + head * HD) : (k_out + (head - NQ) * HD);
+    o[lane] = static_cast<T>(rx1);
+    o[lane + HD / 2] = static_cast<T>(rx2);
+"""
+
+_qkrope_kernel = (
+    mx.fast.metal_kernel(
+        name="lfm2_qknorm_rope",
+        input_names=["qkv", "qw", "kw", "consts"],
+        output_names=["q_out", "k_out"],
+        source=_qkrope_source,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
+_QKROPE_SG_PER_TG = 8
+
+
+def _fused_qknorm_rope(qkv, q_w, k_w, offset, base, eps, n_q, n_kv, hd):
+    """qkv: [1, 1, (n_q+2*n_kv)*hd] decode projections -> rope'd
+    q [1, n_q, 1, hd], k [1, n_kv, 1, hd] (sdpa-ready); v untouched."""
+    import math
+
+    consts = mx.array([math.log2(base), eps, float(offset)], dtype=mx.float32)
+    n_heads = n_q + n_kv
+    n_tg = (n_heads + _QKROPE_SG_PER_TG - 1) // _QKROPE_SG_PER_TG
+    q, k = _qkrope_kernel(
+        inputs=[qkv.reshape(-1), q_w, k_w, consts],
+        template=[
+            ("T", qkv.dtype),
+            ("HD", hd),
+            ("NQ", n_q),
+            ("NKV", n_kv),
+            ("SG_PER_TG", _QKROPE_SG_PER_TG),
+        ],
+        grid=(n_tg * _QKROPE_SG_PER_TG * 32, 1, 1),
+        threadgroup=(_QKROPE_SG_PER_TG * 32, 1, 1),
+        output_shapes=[(n_q * hd,), (n_kv * hd,)],
+        output_dtypes=[qkv.dtype, qkv.dtype],
+    )
+    return q.reshape(1, n_q, 1, hd), k.reshape(1, n_kv, 1, hd)
+
+
 def _row_slices(proj, x, bounds):
     """Per-projection matmuls against row slices of a merged (quantized) linear.
 
@@ -216,6 +313,33 @@ class Attention(nn.Module):
 
         if hasattr(self, "qkv_proj"):
             if B * L == 1:
+                if (
+                    _qkrope_fuse()
+                    and _qkrope_kernel is not None
+                    and cache is not None
+                    and self.head_dim == 64
+                ):
+                    qkv = self.qkv_proj(x)
+                    queries, keys = _fused_qknorm_rope(
+                        qkv,
+                        self.q_layernorm.weight,
+                        self.k_layernorm.weight,
+                        cache.offset,
+                        self.rope.base,
+                        self.q_layernorm.eps,
+                        self.n_heads,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    )
+                    values = qkv[..., -self.n_kv_heads * self.head_dim :].reshape(
+                        B, L, self.n_kv_heads, self.head_dim
+                    ).transpose(0, 2, 1, 3)
+                    keys, values = cache.update_and_fetch(keys, values)
+                    output = scaled_dot_product_attention(
+                        queries, keys, values, cache=cache, mask=mask, scale=self.scale
+                    )
+                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                    return self.out_proj(output)
                 qkv = self.qkv_proj(x).reshape(
                     B, L, self.n_heads + 2 * self.n_kv_heads, self.head_dim
                 )
