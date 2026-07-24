@@ -1,9 +1,38 @@
 # Copyright © 2025 Apple Inc.
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# Merge decode-side projection launches (q/k/v -> qkv, w1/w3 -> w13).
+# MLX_LFM2_FUSED_PROJ=0 restores the upstream per-projection layout exactly.
+_FUSED_PROJ = os.environ.get("MLX_LFM2_FUSED_PROJ", "1") != "0"
+
+
+def _row_slices(proj, x, bounds):
+    """Per-projection matmuls against row slices of a merged (quantized) linear.
+
+    Row-slicing keeps each projection's kernel invocation identical to the
+    unmerged layout (bitwise; the single merged matmul is only bitwise at M==1,
+    where the row-parallel qmv path is shape-independent).
+    """
+    if isinstance(proj, nn.QuantizedLinear):
+        return [
+            mx.quantized_matmul(
+                x,
+                proj.weight[s:e],
+                proj.scales[s:e],
+                proj.biases[s:e],
+                transpose=True,
+                group_size=proj.group_size,
+                bits=proj.bits,
+                mode=proj.mode,
+            )
+            for s, e in bounds
+        ]
+    return [x @ proj.weight[s:e].T for s, e in bounds]
 
 from .activations import swiglu
 from .base import (
@@ -65,9 +94,14 @@ class Attention(nn.Module):
         self.q_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
         self.k_layernorm = nn.RMSNorm(head_dim, eps=args.norm_eps)
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        if _FUSED_PROJ:
+            self.qkv_proj = nn.Linear(
+                dim, (n_heads + 2 * n_kv_heads) * head_dim, bias=False
+            )
+        else:
+            self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+            self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.out_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.rope = nn.RoPE(
@@ -84,15 +118,34 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if _FUSED_PROJ:
+            if B * L == 1:
+                qkv = self.qkv_proj(x).reshape(
+                    B, L, self.n_heads + 2 * self.n_kv_heads, self.head_dim
+                )
+                queries, keys, values = mx.split(
+                    qkv, [self.n_heads, self.n_heads + self.n_kv_heads], axis=2
+                )
+            else:
+                nq = self.n_heads * self.head_dim
+                nkv = self.n_kv_heads * self.head_dim
+                queries, keys, values = _row_slices(
+                    self.qkv_proj,
+                    x,
+                    [(0, nq), (nq, nq + nkv), (nq + nkv, nq + 2 * nkv)],
+                )
+                queries = queries.reshape(B, L, self.n_heads, -1)
+                keys = keys.reshape(B, L, self.n_kv_heads, -1)
+                values = values.reshape(B, L, self.n_kv_heads, -1)
+        else:
+            queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+            queries = queries.reshape(B, L, self.n_heads, -1)
+            keys = keys.reshape(B, L, self.n_kv_heads, -1)
+            values = values.reshape(B, L, self.n_kv_heads, -1)
 
-        queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        keys = self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = self.q_layernorm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_layernorm(keys).transpose(0, 2, 1, 3)
+        values = values.transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -186,11 +239,22 @@ class MLP(nn.Module):
                 ff_dim = int(ffn_dim_multiplier * ff_dim)
             ff_dim = multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, ff_dim, bias=False)
-        self.w3 = nn.Linear(dim, ff_dim, bias=False)
+        self.ff_dim = ff_dim
+        if _FUSED_PROJ:
+            self.w13 = nn.Linear(dim, 2 * ff_dim, bias=False)
+        else:
+            self.w1 = nn.Linear(dim, ff_dim, bias=False)
+            self.w3 = nn.Linear(dim, ff_dim, bias=False)
         self.w2 = nn.Linear(ff_dim, dim, bias=False)
 
     def __call__(self, x) -> mx.array:
+        if _FUSED_PROJ:
+            if x.size == x.shape[-1]:
+                w1x, w3x = mx.split(self.w13(x), 2, axis=-1)
+            else:
+                ff = self.ff_dim
+                w1x, w3x = _row_slices(self.w13, x, [(0, ff), (ff, 2 * ff)])
+            return self.w2(swiglu(w1x, w3x))
         return self.w2(swiglu(self.w1(x), self.w3(x)))
 
 
@@ -303,7 +367,31 @@ class Model(nn.Module):
                     param = param.transpose(0, 2, 1)
 
             sanitized_weights[name] = param
+
+        if _FUSED_PROJ:
+            sanitized_weights = self._merge_projections(sanitized_weights)
         return sanitized_weights
+
+    @staticmethod
+    def _merge_projections(weights):
+        # Checkpoints store per-projection tensors; the merged modules take
+        # their row-wise (N-dim) concatenation, which leaves every output row's
+        # dot product unchanged. Quantized scales/biases concatenate the same
+        # way as the packed weights.
+        merges = {}
+        for name in weights:
+            for src, dst, order in (
+                ("q_proj", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                ("w1", "w13", ("w1", "w3")),
+            ):
+                head, sep, tail = name.rpartition(f".{src}.")
+                if sep:
+                    merges[(head, dst, tail)] = order
+        merged = dict(weights)
+        for (head, dst, tail), order in merges.items():
+            parts = [merged.pop(f"{head}.{src}.{tail}") for src in order]
+            merged[f"{head}.{dst}.{tail}"] = mx.concatenate(parts, axis=0)
+        return merged
 
     @property
     def layers(self):
