@@ -11,6 +11,98 @@ import mlx.nn as nn
 _FUSED_PROJ = os.environ.get("MLX_LFM2_FUSED_PROJ", "1") != "0"
 
 
+# Fuse the decode-step ShortConv glue (split, B*x gate, state shift, 3-tap
+# depthwise conv, C*y gate) into one kernel. MLX_LFM2_CONVFUSE=0 restores the
+# upstream op-by-op path exactly.
+_CONV_FUSE = os.environ.get("MLX_LFM2_CONVFUSE", "1") != "0"
+
+# Roundings between the replaced kernels are explicit (RNE via integer bit ops
+# for bfloat) so fast-math cannot contract them; the conv accumulates in float
+# in ascending tap order like mlx's depthwise_conv_1d kernel it replaces.
+_conv_step_header = """
+template <typename U>
+inline float round_U(float x);
+
+template <>
+inline float round_U<bfloat16_t>(float x) {
+  uint u = as_type<uint>(x);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  u &= 0xffff0000u;
+  return as_type<float>(u);
+}
+
+template <>
+inline float round_U<half>(float x) {
+  return float(half(x));
+}
+
+template <>
+inline float round_U<float>(float x) {
+  return x;
+}
+"""
+
+_conv_step_source = """
+    // one thread per (batch, channel); bcx: [B, 3C], state: [B, KS-1, C],
+    // w: [C, KS]; y: [B, C], state_out: [B, KS-1, C]
+    uint gid = thread_position_in_grid.x;
+    const uint b = gid / C;
+    const uint c = gid % C;
+    const device T* row = bcx + b * 3 * C;
+
+    // B*x gate, rounded exactly like the standalone multiply kernel.
+    const float bv = float(row[c]);
+    const float xv = float(row[2 * C + c]);
+    const float bx = round_U<T>(bv * xv);
+
+    // Ascending-tap float accumulation, matching depthwise_conv_1d.
+    float acc = 0.0f;
+    const device T* srow = state + (b * (KS - 1)) * C;
+    for (uint j = 0; j + 1 < KS; j++) {
+      acc += float(srow[j * C + c]) * float(w[c * KS + j]);
+    }
+    acc += bx * float(w[c * KS + (KS - 1)]);
+    const float conv = round_U<T>(acc);
+
+    // C*y gate.
+    const float cv = float(row[C + c]);
+    y[b * C + c] = static_cast<T>(round_U<T>(cv * conv));
+
+    device T* orow = state_out + (b * (KS - 1)) * C;
+    for (uint j = 0; j + 2 < KS; j++) {
+      orow[j * C + c] = srow[(j + 1) * C + c];
+    }
+    orow[(KS - 2) * C + c] = static_cast<T>(bx);
+"""
+
+_conv_step_kernel = (
+    mx.fast.metal_kernel(
+        name="lfm2_conv_step",
+        input_names=["bcx", "state", "w"],
+        output_names=["y", "state_out"],
+        header=_conv_step_header,
+        source=_conv_step_source,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
+
+def _fused_conv_step(BCx, state, weight):
+    """BCx: [B, 1, 3C]; state: [B, KS-1, C]; weight: conv weight [C, KS, 1]."""
+    B = BCx.shape[0]
+    C, KS = weight.shape[0], weight.shape[1]
+    y, state_out = _conv_step_kernel(
+        inputs=[BCx.reshape(B, 3 * C), state, weight.reshape(C, KS)],
+        template=[("T", BCx.dtype), ("C", C), ("KS", KS)],
+        grid=(B * C, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, C), (B, KS - 1, C)],
+        output_dtypes=[BCx.dtype, BCx.dtype],
+    )
+    return y.reshape(B, 1, C), state_out
+
+
 def _row_slices(proj, x, bounds):
     """Per-projection matmuls against row slices of a merged (quantized) linear.
 
@@ -190,6 +282,26 @@ class ShortConv(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
+        if (
+            _CONV_FUSE
+            and _conv_step_kernel is not None
+            and not self.bias
+            and cache is not None
+            and cache.lengths is None
+            and mask is None
+            and x.shape[1] == 1
+        ):
+            BCx = self.in_proj(x)
+            state = cache[0]
+            if state is None:
+                state = mx.zeros(
+                    (BCx.shape[0], self.L_cache - 1, self.args.hidden_size),
+                    dtype=BCx.dtype,
+                )
+            y, cache[0] = _fused_conv_step(BCx, state, self.conv.weight)
+            cache.advance(1)
+            return self.out_proj(y)
+
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
